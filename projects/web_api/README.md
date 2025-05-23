@@ -29,3 +29,9 @@ docker run --rm -it --gpus=all -p 8000:8000 mineru-api
 http://localhost:8000/docs
 http://127.0.0.1:8000/docs
 ```
+
+## 修改后的执行
+```bash
+ docker run -d --gpus all -p 10086:8000 --network docker_ssrf_proxy_network --name mineru-api-v3 -v minerupaddleocr:/root/.paddleocr mineru-api:v0.3
+```
+

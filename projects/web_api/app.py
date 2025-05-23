@@ -3,33 +3,36 @@ import os
 from base64 import b64encode
 from glob import glob
 from io import StringIO
-import tempfile
 from typing import Tuple, Union
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 from loguru import logger
+from numpy.distutils.lib2def import output_def
 
-from magic_pdf.data.read_api import read_local_images, read_local_office
 import magic_pdf.model as model_config
 from magic_pdf.config.enums import SupportedPdfParseMethod
-from magic_pdf.data.data_reader_writer import DataWriter, FileBasedDataWriter
+from magic_pdf.data.data_reader_writer import DataWriter, FileBasedDataWriter, FileBasedDataReader
 from magic_pdf.data.data_reader_writer.s3 import S3DataReader, S3DataWriter
-from magic_pdf.data.dataset import ImageDataset, PymuDocDataset
+from magic_pdf.data.dataset import PymuDocDataset, ImageDataset
+
 from magic_pdf.libs.config_reader import get_bucket_name, get_s3_config
 from magic_pdf.model.doc_analyze_by_custom_model import doc_analyze
 from magic_pdf.operators.models import InferenceResult
 from magic_pdf.operators.pipes import PipeResult
-from fastapi import Form
+
+
+import tempfile
+import platform
+import shutil
+from pathlib import Path
+from magic_pdf.utils.office_to_pdf import convert_file_to_pdf as convert_office_file_to_pdf_linux
 
 model_config.__use_inside_model__ = True
 
 app = FastAPI()
 
-pdf_extensions = [".pdf"]
-office_extensions = [".ppt", ".pptx", ".doc", ".docx"]
-image_extensions = [".png", ".jpg", ".jpeg"]
 
 class MemoryDataWriter(DataWriter):
     def __init__(self):
@@ -51,9 +54,73 @@ class MemoryDataWriter(DataWriter):
         self.buffer.close()
 
 
+
+def encode_image(image_path: str) -> str:
+    """Encode image using base64"""
+    with open(image_path, "rb") as f:
+        return b64encode(f.read()).decode()
+
+
+
+def convert_office_file_to_pdf_windows(input_path, output_folder):
+    import win32com.client
+    # Create output folder if it doesn't exist
+    os.makedirs(output_folder, exist_ok=True)
+
+    # Get file extension
+    _, ext = os.path.splitext(input_path)
+    ext = ext.lower()
+
+    # Initialize the correct Office application
+    if ext not in [".docx", ".xlsx",  ".pptx" ]:
+        raise ValueError("Unsupported file format")
+
+    if ext == ".docx":
+        app = win32com.client.Dispatch("Word.Application")
+    elif ext == ".xlsx":
+        app = win32com.client.Dispatch("Excel.Application")
+    else:
+        app = win32com.client.Dispatch("PowerPoint.Application")
+
+
+    try:
+        # Convert to PDF
+        output_path = os.path.join(output_folder, os.path.basename(input_path).replace(ext, ".pdf"))
+
+        if ext == ".docx":
+            doc = app.Documents.Open(input_path)
+            doc.SaveAs(output_path, FileFormat=17)  # 17 = PDF format
+            doc.Close()
+        elif ext == ".xlsx":
+            workbook = app.Workbooks.Open(input_path)
+            workbook.ExportAsFixedFormat(0, output_path)  # 0 = PDF format
+            workbook.Close()
+        else:
+            ppt = app.Presentations.Open(input_path)
+            ppt.SaveAs(output_path, 32)  # 32 = PDF format
+            ppt.Close()
+
+        print(f"Successfully converted: {input_path} → {output_path}")
+    except Exception as e:
+        print(f"Error converting {input_path}: {e}")
+    finally:
+        app.Quit()
+
+
+def convert_image_to_pdf(input_path, output_folder):
+    ''' 将图片转换成pdf '''
+    import img2pdf
+
+    pic_name, _ = os.path.splitext(input_path)
+    output_path = os.path.join(output_folder, f"{pic_name}.pdf")
+
+    os.makedirs(output_folder, exist_ok=True)
+    with open(output_path, "wb") as f:
+        f.write(img2pdf.convert(input_path))
+
+
 def init_writers(
     file_path: str = None,
-    file: UploadFile = None,
     output_path: str = None,
     output_image_path: str = None,
 ) -> Tuple[
@@ -62,58 +129,17 @@ def init_writers(
     bytes,
 ]:
     """
-    Initialize writers based on path type
-
-    Args:
-        file_path: file path (local path or S3 path)
-        file: Uploaded file object
-        output_path: Output directory path
-        output_image_path: Image output directory path
-
-    Returns:
-        Tuple[writer, image_writer, file_bytes]: Returns initialized writer tuple and file content
     """
-    file_extension:str = None
-    if file_path:
-        is_s3_path = file_path.startswith("s3://")
-        if is_s3_path:
-            bucket = get_bucket_name(file_path)
-            ak, sk, endpoint = get_s3_config(bucket)
 
-            writer = S3DataWriter(
-                output_path, bucket=bucket, ak=ak, sk=sk, endpoint_url=endpoint
-            )
-            image_writer = S3DataWriter(
-                output_image_path, bucket=bucket, ak=ak, sk=sk, endpoint_url=endpoint
-            )
-            # 临时创建reader读取文件内容
-            temp_reader = S3DataReader(
-                "", bucket=bucket, ak=ak, sk=sk, endpoint_url=endpoint
-            )
-            file_bytes = temp_reader.read(file_path)
-            file_extension = os.path.splitext(file_path)[1]
-        else:
-            writer = FileBasedDataWriter(output_path)
-            image_writer = FileBasedDataWriter(output_image_path)
-            os.makedirs(output_image_path, exist_ok=True)
-            with open(file_path, "rb") as f:
-                file_bytes = f.read()
-            file_extension = os.path.splitext(file_path)[1]
-    else:
-        # 处理上传的文件
-        file_bytes = file.file.read()
-        file_extension = os.path.splitext(file.filename)[1]
-
-        writer = FileBasedDataWriter(output_path)
-        image_writer = FileBasedDataWriter(output_image_path)
-        os.makedirs(output_image_path, exist_ok=True)
-
-    return writer, image_writer, file_bytes, file_extension
-
+    writer = FileBasedDataWriter(output_path)
+    image_writer = FileBasedDataWriter(output_image_path)
+    os.makedirs(output_image_path, exist_ok=True)
+    reader = FileBasedDataReader()
+    file_bytes = reader.read(file_path)
+    return writer, image_writer, file_bytes
 
 def process_file(
     file_bytes: bytes,
-    file_extension: str,
     parse_method: str,
     image_writer: Union[S3DataWriter, FileBasedDataWriter],
 ) -> Tuple[InferenceResult, PipeResult]:
@@ -121,8 +147,7 @@ def process_file(
     Process PDF file content
 
     Args:
-        file_bytes: Binary content of file
-        file_extension: file extension
+        pdf_bytes: Binary content of PDF file
         parse_method: Parse method ('ocr', 'txt', 'auto')
         image_writer: Image writer
 
@@ -130,21 +155,8 @@ def process_file(
         Tuple[InferenceResult, PipeResult]: Returns inference result and pipeline result
     """
 
-    ds: Union[PymuDocDataset, ImageDataset] = None
-    if file_extension in pdf_extensions:
-        ds = PymuDocDataset(file_bytes)
-    elif file_extension in office_extensions:
-        # 需要使用office解析
-        temp_dir = tempfile.mkdtemp()
-        with open(os.path.join(temp_dir, f"temp_file.{file_extension}"), "wb") as f:
-            f.write(file_bytes)
-        ds = read_local_office(temp_dir)[0]
-    elif file_extension in image_extensions:
-        # 需要使用ocr解析
-        temp_dir = tempfile.mkdtemp()
-        with open(os.path.join(temp_dir, f"temp_file.{file_extension}"), "wb") as f:
-            f.write(file_bytes)
-        ds = read_local_images(temp_dir)[0]
+
+    ds = PymuDocDataset(file_bytes)
     infer_result: InferenceResult = None
     pipe_result: PipeResult = None
 
@@ -165,74 +177,80 @@ def process_file(
     return infer_result, pipe_result
 
 
-def encode_image(image_path: str) -> str:
-    """Encode image using base64"""
-    with open(image_path, "rb") as f:
-        return b64encode(f.read()).decode()
+async def save_file_to_local(upload_file: UploadFile, output_path):
+    '''将上传的文件保存到本地'''
+    contents = await upload_file.read()
+    # 保存文件
+    save_path = os.path.join(output_path, upload_file.filename)
+    with open(save_path, "wb") as f:
+        f.write(contents)
+
+    return save_path
 
 
 @app.post(
-    "/file_parse",
+    "/file_process",
     tags=["projects"],
-    summary="Parse files (supports local files and S3)",
+    summary="process different kind of file, such as ppt, word, pdf, png, jpg",
 )
-async def file_parse(
-    file: UploadFile = None,
-    file_path: str = Form(None),
-    parse_method: str = Form("auto"),
-    is_json_md_dump: bool = Form(False),
-    output_dir: str = Form("output"),
-    return_layout: bool = Form(False),
-    return_info: bool = Form(False),
-    return_content_list: bool = Form(False),
-    return_images: bool = Form(False),
+async def file_process(
+    upload_file: UploadFile,
+    parse_method: str = "auto",
+    is_json_md_dump: bool = False,
+    output_dir: str = "output",
+    return_layout: bool = False,
+    return_info: bool = False,
+    return_content_list: bool = False,
+    return_images: bool = False,
 ):
-    """
-    Execute the process of converting PDF to JSON and MD, outputting MD and JSON files
-    to the specified directory.
-
-    Args:
-        file: The PDF file to be parsed. Must not be specified together with
-            `file_path`
-        file_path: The path to the PDF file to be parsed. Must not be specified together
-            with `file`
-        parse_method: Parsing method, can be auto, ocr, or txt. Default is auto. If
-            results are not satisfactory, try ocr
-        is_json_md_dump: Whether to write parsed data to .json and .md files. Default
-            to False. Different stages of data will be written to different .json files
-            (3 in total), md content will be saved to .md file
-        output_dir: Output directory for results. A folder named after the PDF file
-            will be created to store all results
-        return_layout: Whether to return parsed PDF layout. Default to False
-        return_info: Whether to return parsed PDF info. Default to False
-        return_content_list: Whether to return parsed PDF content list. Default to False
-    """
     try:
-        if (file is None and file_path is None) or (
-            file is not None and file_path is not None
-        ):
+        ## 解析上传的文档名称和文档类型
+        file_name, ext = os.path.splitext(upload_file.filename)
+        ext = ext.lower()
+
+        ## 判断文件类型是否符合要求
+        if ext not in ['.pdf', '.docx', '.doc', '.ppt', '.pptx', '.png', '.jpg', '.jpeg']:
             return JSONResponse(
-                content={"error": "Must provide either file or file_path"},
+                content={"error": f"unsupport file type:{ext}"},
                 status_code=400,
             )
 
-        # Get PDF filename
-        file_name = os.path.basename(file_path if file_path else file.filename).split(
-            "."
-        )[0]
-        output_path = f"{output_dir}/{file_name}"
-        output_image_path = f"{output_path}/images"
+        ## 创建临时文件夹，保存上传文档
+        temp_dir = tempfile.mkdtemp()
+        temp_file_path = await save_file_to_local(upload_file, temp_dir)
+
+        ## 如果是office格式的文档，则转换成pdf
+        process_file_name = temp_file_path
+        plat = platform.system()
+        if ext in [ '.docx', '.doc', '.ppt', '.pptx']:
+            if plat == "Windows":
+                convert_office_file_to_pdf_windows(temp_file_path, temp_dir)
+            else:
+                convert_office_file_to_pdf_linux(temp_file_path, temp_dir)
+
+            process_file_name = os.path.join(temp_dir, f"{file_name}.pdf")
+
+        elif ext in ['.png', '.jpg', '.jpeg']:
+            convert_image_to_pdf(temp_file_path, temp_dir)
+            process_file_name = os.path.join(temp_dir, f"{file_name}.pdf")
+
+
+
+        output_path = os.path.join(output_dir, file_name)
+        output_image_path = os.path.join(output_path, "images")
 
         # Initialize readers/writers and get PDF content
-        writer, image_writer, file_bytes, file_extension = init_writers(
-            file_path=file_path,
-            file=file,
+        writer, image_writer, file_bytes = init_writers(
+            file_path=process_file_name,
             output_path=output_path,
             output_image_path=output_image_path,
         )
 
-        # Process PDF
-        infer_result, pipe_result = process_file(file_bytes, file_extension, parse_method, image_writer)
+        ## 删除临时文件夹
+        shutil.rmtree(temp_dir)
+
+        # Process file
+        infer_result, pipe_result = process_file(file_bytes, parse_method, image_writer)
 
         # Use MemoryDataWriter to get results
         content_list_writer = MemoryDataWriter()
@@ -302,4 +320,4 @@ async def file_parse(
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8888)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
